@@ -1,171 +1,316 @@
 /************************************************************
- * FILE: robot_controller.ino
- * ROLE: Autonomous Robot ESP32 (Sensor + Navigation Node)
- * COMMUNICATION: ESP-NOW (Sender)
+ * AUTONOMOUS ROBOT ESP32 - ENVIRONMENTAL MONITOR
+ *
+ * Purpose: Collects environmental data and navigates autonomously
+ * Communication: ESP-NOW protocol to Room ESP32
+ * Sensors: Temperature, Humidity, Gas, Motion, Distance
+ * Actuators: DC Motors (L298N driver)
+ *
+ * Author Notes:
+ *   - This robot moves throughout the environment
+ *   - Sends real-time sensor data every 1.5 seconds
+ *   - Avoids obstacles automatically
+ *   - Reports to central room controller
  ************************************************************/
 
 #include <WiFi.h>
 #include <esp_now.h>
 #include <DHT.h>
 
-/* ---------------- PIN DEFINITIONS ---------------- */
+/* ============================================
+ * HARDWARE PIN CONFIGURATION
+ * ============================================ */
 
-// Ultrasonic Sensor
-#define TRIG_PIN 5
-#define ECHO_PIN 18
+// Ultrasonic Sensor Pins (HC-SR04)
+#define ULTRASONIC_TRIG_PIN 5  // Trigger pulse output
+#define ULTRASONIC_ECHO_PIN 18 // Echo pulse input
 
-// PIR Sensor
-#define PIR_PIN 19
+// Motion Sensor Pin (HC-SR501 PIR)
+#define MOTION_SENSOR_PIN 19
 
-// Gas Sensor (MQ series)
-#define GAS_PIN 34 // ADC pin
+// Gas Sensor Pin (MQ-X Series - Analog)
+#define GAS_SENSOR_PIN 34 // ADC pin for analog reading
 
-// DHT11
-#define DHTPIN 4
-#define DHTTYPE DHT11
+// Temperature & Humidity Sensor (DHT11)
+#define DHT_DATA_PIN 4
+#define DHT_SENSOR_TYPE DHT11
 
-// L298N Motor Driver
-#define IN1 13
-#define IN2 12
-#define IN3 14
-#define IN4 27
+// Motor Driver Pins (L298N Module)
+// Motor A (Left side)
+#define MOTOR_LEFT_PIN1 13
+#define MOTOR_LEFT_PIN2 12
+// Motor B (Right side)
+#define MOTOR_RIGHT_PIN1 14
+#define MOTOR_RIGHT_PIN2 27
 
-/* ---------------- DATA STRUCTURE ---------------- */
+/* ============================================
+ * SYSTEM CONFIGURATION & THRESHOLDS
+ * ============================================ */
 
-typedef struct struct_message
+// Obstacle Detection Parameters
+#define OBSTACLE_DISTANCE_THRESHOLD 20 // cm - trigger avoidance
+#define OBSTACLE_CHECK_TIMEOUT 30000   // microseconds
+#define TURN_DELAY_MS 400              // Time to turn away from obstacle
+#define STOP_DELAY_MS 200              // Time to pause before turning
+
+// Data Transmission Parameters
+#define SENSOR_READ_INTERVAL 1500 // milliseconds between readings
+#define ESP_NOW_CHANNEL 0         // WiFi channel (must match room esp32)
+
+// Sensor Calibration
+#define GAS_SENSOR_MAX_READING 4095      // Maximum ADC value
+#define DISTANCE_CONVERSION_FACTOR 0.034 // Speed of sound calculation
+
+// Motion & Status Indicators
+#define MOVEMENT_FORWARD 1
+#define MOVEMENT_STOPPED 0
+#define MOVEMENT_TURNING 2
+
+/* ============================================
+ * DATA STRUCTURES
+ * ============================================ */
+
+// Sensor readings packet sent to room controller
+typedef struct robot_sensor_data
 {
-    float temperature;
-    float humidity;
-    int gasLevel;
-    int motion;
-    int distance;
-} struct_message;
+    float temperature;        // °C from DHT11
+    float humidity;           // % RH from DHT11
+    int gas_level;            // 0-4095 ADC reading from MQ sensor
+    int motion_detected;      // 1 if motion, 0 if none
+    int distance_to_obstacle; // cm from ultrasonic sensor
+} robot_sensor_data;
 
-struct_message robotData;
+// Global instance to store current sensor data
+robot_sensor_data sensor_readings;
 
-/* ---------------- ROOM ESP32 MAC ADDRESS ---------------- */
-/* REPLACE THIS WITH YOUR ROOM ESP32 MAC ADDRESS */
-uint8_t roomAddress[] = {0x24, 0x6F, 0x28, 0xAA, 0xBB, 0xCC};
+// Room ESP32 MAC address - used for ESP-NOW addressing
+// YOU MUST UPDATE THIS WITH YOUR ROOM ESP32's MAC ADDRESS
+uint8_t room_esp32_mac[] = {0x24, 0x6F, 0x28, 0xAA, 0xBB, 0xCC};
 
-/* ---------------- OBJECTS ---------------- */
-DHT dht(DHTPIN, DHTTYPE);
+/* ============================================
+ * SENSOR OBJECTS & INSTANCES
+ * ============================================ */
 
-/* ---------------- ESP-NOW SETUP ---------------- */
+// DHT11 sensor instance for temperature/humidity
+DHT dht_sensor(DHT_DATA_PIN, DHT_SENSOR_TYPE);
 
-void setupESPNow()
+/* ============================================
+ * ESP-NOW INITIALIZATION & SETUP
+ *
+ * We're using ESP-NOW for low-latency, energy-efficient
+ * communication with the room controller. No WiFi needed!
+ * ============================================ */
+
+void setup_espnow_communication()
 {
+    // Set device to WiFi Station mode (not access point)
     WiFi.mode(WIFI_STA);
 
+    // Initialize ESP-NOW protocol
     if (esp_now_init() != ESP_OK)
     {
-        Serial.println("ESP-NOW Initialization Failed");
+        Serial.println("ERROR: ESP-NOW initialization failed!");
         return;
     }
 
-    esp_now_peer_info_t peerInfo = {};
-    memcpy(peerInfo.peer_addr, roomAddress, 6);
-    peerInfo.channel = 0;
-    peerInfo.encrypt = false;
+    // Prepare peer information for room controller
+    esp_now_peer_info_t peer_info = {};
+    memcpy(peer_info.peer_addr, room_esp32_mac, 6);
+    peer_info.channel = ESP_NOW_CHANNEL;
+    peer_info.encrypt = false; // Local network, encryption not needed
 
-    if (esp_now_add_peer(&peerInfo) != ESP_OK)
+    // Register the room controller as a peer
+    if (esp_now_add_peer(&peer_info) != ESP_OK)
     {
-        Serial.println("Failed to add peer");
+        Serial.println("ERROR: Failed to register room controller as peer!");
         return;
     }
 
-    Serial.println("ESP-NOW Ready (Robot)");
+    Serial.println("✓ ESP-NOW Ready - Robot is broadcasting sensor data");
 }
 
-/* ---------------- MOVEMENT FUNCTIONS ---------------- */
+/* ============================================
+ * MOTOR CONTROL FUNCTIONS
+ *
+ * These functions control the L298N motor driver
+ * to move the robot in different directions.
+ *
+ * Motor Logic:
+ *   IN1=HIGH, IN2=LOW  → Motor spins forward
+ *   IN1=LOW, IN2=HIGH  → Motor spins backward
+ *   IN1=HIGH, IN2=HIGH → Motor stops
+ *   IN1=LOW, IN2=LOW   → Motor stops
+ * ============================================ */
 
-void moveForward()
+// Move the robot forward (both motors forward)
+void move_forward()
 {
-    digitalWrite(IN1, HIGH);
-    digitalWrite(IN2, LOW);
-    digitalWrite(IN3, HIGH);
-    digitalWrite(IN4, LOW);
+    digitalWrite(MOTOR_LEFT_PIN1, HIGH);
+    digitalWrite(MOTOR_LEFT_PIN2, LOW);
+    digitalWrite(MOTOR_RIGHT_PIN1, HIGH);
+    digitalWrite(MOTOR_RIGHT_PIN2, LOW);
 }
 
-void turnRight()
+// Turn the robot right (left motor forward, right motor backward)
+void turn_right()
 {
-    digitalWrite(IN1, HIGH);
-    digitalWrite(IN2, LOW);
-    digitalWrite(IN3, LOW);
-    digitalWrite(IN4, HIGH);
+    digitalWrite(MOTOR_LEFT_PIN1, HIGH);
+    digitalWrite(MOTOR_LEFT_PIN2, LOW);
+    digitalWrite(MOTOR_RIGHT_PIN1, LOW);
+    digitalWrite(MOTOR_RIGHT_PIN2, HIGH);
 }
 
-void stopCar()
+// Stop all motors immediately
+void stop_all_motors()
 {
-    digitalWrite(IN1, LOW);
-    digitalWrite(IN2, LOW);
-    digitalWrite(IN3, LOW);
-    digitalWrite(IN4, LOW);
+    digitalWrite(MOTOR_LEFT_PIN1, LOW);
+    digitalWrite(MOTOR_LEFT_PIN2, LOW);
+    digitalWrite(MOTOR_RIGHT_PIN1, LOW);
+    digitalWrite(MOTOR_RIGHT_PIN2, LOW);
 }
 
-/* ---------------- DISTANCE FUNCTION ---------------- */
+/* ============================================
+ * ULTRASONIC DISTANCE MEASUREMENT
+ *
+ * This function measures distance using the HC-SR04 sensor.
+ *
+ * How it works:
+ *   1. Send 10μs pulse on TRIG pin
+ *   2. ECHO pin goes HIGH when pulse reflects back
+ *   3. Measure time HIGH = duration
+ *   4. Calculate distance: duration * 0.034 / 2
+ *
+ * Returns: Distance in centimeters
+ *          999 if timeout (no obstacle detected)
+ * ============================================ */
 
-long getDistance()
+int read_distance_cm()
 {
-    digitalWrite(TRIG_PIN, LOW);
+    // Send trigger pulse to sensor
+    digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
     delayMicroseconds(2);
-    digitalWrite(TRIG_PIN, HIGH);
+    digitalWrite(ULTRASONIC_TRIG_PIN, HIGH);
     delayMicroseconds(10);
-    digitalWrite(TRIG_PIN, LOW);
+    digitalWrite(ULTRASONIC_TRIG_PIN, LOW);
 
-    long duration = pulseIn(ECHO_PIN, HIGH, 30000);
-    if (duration == 0)
-        return 999;
-    return duration * 0.034 / 2;
+    // Wait for echo pulse and measure its duration
+    long echo_duration = pulseIn(ULTRASONIC_ECHO_PIN, HIGH, OBSTACLE_CHECK_TIMEOUT);
+
+    // Check if we got a valid reading
+    if (echo_duration == 0)
+    {
+        return 999; // No object detected in range
+    }
+
+    // Convert time to distance in centimeters
+    // Formula: distance = (time * speed of sound) / 2
+    // Speed of sound ≈ 0.034 cm/μs, divide by 2 for round trip
+    int distance_cm = echo_duration * DISTANCE_CONVERSION_FACTOR / 2;
+
+    return distance_cm;
 }
 
-/* ---------------- SETUP ---------------- */
+/* ============================================
+ * ARDUINO SETUP - Hardware & Peripheral Initialization
+ *
+ * This runs once when the board powers on.
+ * We initialize all sensors, actuators, and communication.
+ * ============================================ */
 
 void setup()
 {
+    // Initialize serial communication for debugging
     Serial.begin(115200);
+    delay(100);
 
-    pinMode(TRIG_PIN, OUTPUT);
-    pinMode(ECHO_PIN, INPUT);
-    pinMode(PIR_PIN, INPUT);
-    pinMode(GAS_PIN, INPUT);
+    Serial.println("\n\n================================");
+    Serial.println("🤖 ROBOT ESP32 STARTING UP");
+    Serial.println("================================");
 
-    pinMode(IN1, OUTPUT);
-    pinMode(IN2, OUTPUT);
-    pinMode(IN3, OUTPUT);
-    pinMode(IN4, OUTPUT);
+    /* Initialize Sensor Input Pins */
+    pinMode(ULTRASONIC_TRIG_PIN, OUTPUT);
+    pinMode(ULTRASONIC_ECHO_PIN, INPUT);
+    pinMode(MOTION_SENSOR_PIN, INPUT);
+    pinMode(GAS_SENSOR_PIN, INPUT); // ADC - no need to set pinMode
 
-    dht.begin();
-    setupESPNow();
+    /* Initialize Motor Driver Output Pins */
+    pinMode(MOTOR_LEFT_PIN1, OUTPUT);
+    pinMode(MOTOR_LEFT_PIN2, OUTPUT);
+    pinMode(MOTOR_RIGHT_PIN1, OUTPUT);
+    pinMode(MOTOR_RIGHT_PIN2, OUTPUT);
 
-    Serial.println("Robot ESP32 Started");
+    // Ensure motors are stopped at startup
+    stop_all_motors();
+
+    /* Initialize DHT11 Temperature/Humidity Sensor */
+    dht_sensor.begin();
+    delay(500); // Let sensor stabilize
+
+    /* Initialize ESP-NOW Communication */
+    setup_espnow_communication();
+
+    Serial.println("✓ All systems initialized successfully");
+    Serial.println("✓ Robot ready for autonomous operation\n");
 }
 
-/* ---------------- LOOP ---------------- */
+/* ============================================
+ * MAIN PROGRAM LOOP - Continuous Operation
+ *
+ * This function runs repeatedly while the robot is powered.
+ * Each cycle:
+ *   1. Read all available sensors (temp, humidity, gas, motion, distance)
+ *   2. Make autonomous navigation decisions based on distance
+ *   3. Send collected data to room controller via ESP-NOW
+ *   4. Wait before next cycle (1.5 seconds)
+ * ============================================ */
 
 void loop()
 {
-    robotData.temperature = dht.readTemperature();
-    robotData.humidity = dht.readHumidity();
-    robotData.gasLevel = analogRead(GAS_PIN);
-    robotData.motion = digitalRead(PIR_PIN);
-    robotData.distance = getDistance();
+    // ===== SENSOR DATA COLLECTION =====
+    // Read temperature and humidity from DHT11
+    sensor_readings.temperature = dht_sensor.readTemperature();
+    sensor_readings.humidity = dht_sensor.readHumidity();
 
-    // Autonomous navigation
-    if (robotData.distance < 20)
+    // Read raw gas sensor analog value (0-4095)
+    sensor_readings.gas_level = analogRead(GAS_SENSOR_PIN);
+
+    // Read motion detection (HIGH if motion, LOW if no motion)
+    sensor_readings.motion_detected = digitalRead(MOTION_SENSOR_PIN);
+
+    // Measure distance to nearest obstacle
+    sensor_readings.distance_to_obstacle = read_distance_cm();
+
+    // ===== AUTONOMOUS NAVIGATION LOGIC =====
+    // Simple obstacle avoidance algorithm:
+    // If something is close, stop and turn right
+    // Otherwise, keep moving forward
+
+    if (sensor_readings.distance_to_obstacle < OBSTACLE_DISTANCE_THRESHOLD)
     {
-        stopCar();
-        delay(200);
-        turnRight();
-        delay(400);
+        // Obstacle detected! Begin avoidance maneuver
+        stop_all_motors();
+        delay(STOP_DELAY_MS); // Pause briefly
+        turn_right();         // Turn away from obstacle
+        delay(TURN_DELAY_MS); // Execute turn
     }
     else
     {
-        moveForward();
+        // Path is clear, move forward
+        move_forward();
     }
 
-    // Send data to Room ESP32
-    esp_now_send(roomAddress, (uint8_t *)&robotData, sizeof(robotData));
+    // ===== SEND DATA TO ROOM CONTROLLER =====
+    // Transmit sensor readings via ESP-NOW
+    // The room ESP32 will receive this and make decisions
+    esp_now_send(room_esp32_mac, (uint8_t *)&sensor_readings, sizeof(sensor_readings));
 
-    Serial.println("Data sent to Room ESP32");
-    delay(1500);
+    // Optional: Debug output to serial monitor
+    Serial.print("📡 Sent - Temp: ");
+    Serial.print(sensor_readings.temperature);
+    Serial.print("°C | Dist: ");
+    Serial.print(sensor_readings.distance_to_obstacle);
+    Serial.println(" cm");
+
+    // Wait before next sensor reading cycle
+    delay(SENSOR_READ_INTERVAL);
 }
