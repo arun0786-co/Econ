@@ -15,6 +15,7 @@
 
 #include <WiFi.h>
 #include <esp_now.h>
+#include <esp_wifi.h>
 #include <DHT.h>
 
 /* ============================================
@@ -55,7 +56,7 @@
 
 // Data Transmission Parameters
 #define SENSOR_READ_INTERVAL 1500 // milliseconds between readings
-#define ESP_NOW_CHANNEL 0         // WiFi channel (must match room esp32)
+#define WIFI_CHANNEL 1            // MUST be your router's wifi channel. room esp32 prints it at boot
 
 // Sensor Calibration
 #define GAS_SENSOR_MAX_READING 4095      // Maximum ADC value
@@ -106,6 +107,11 @@ void setup_espnow_communication()
     // Set device to WiFi Station mode (not access point)
     WiFi.mode(WIFI_STA);
 
+    // The room esp32 is connected to the router, so its radio sits on the router's channel.
+    // We are not connected to anything, so we have to move to that same channel by hand,
+    // else every packet we send is lost without any error.
+    esp_wifi_set_channel(WIFI_CHANNEL, WIFI_SECOND_CHAN_NONE);
+
     // Initialize ESP-NOW protocol
     if (esp_now_init() != ESP_OK)
     {
@@ -116,7 +122,7 @@ void setup_espnow_communication()
     // Prepare peer information for room controller
     esp_now_peer_info_t peer_info = {};
     memcpy(peer_info.peer_addr, room_esp32_mac, 6);
-    peer_info.channel = ESP_NOW_CHANNEL;
+    peer_info.channel = WIFI_CHANNEL;
     peer_info.encrypt = false; // Local network, encryption not needed
 
     // Register the room controller as a peer
