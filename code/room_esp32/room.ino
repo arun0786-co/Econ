@@ -17,7 +17,7 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <HTTPClient.h>
-#include <Servo.h>
+#include <ESP32Servo.h> // the normal Servo library does not work on ESP32
 
 /* ============================================
  * WIFI & CLOUD SERVICES CONFIGURATION
@@ -103,8 +103,20 @@ Servo window_servo;
  * We just copy the data to our buffer for processing.
  * ============================================ */
 
+// ESP32 board package 3.x changed this callback, so we support both
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+void on_data_received(const esp_now_recv_info_t *info, const uint8_t *incoming_data_buffer, int data_length)
+#else
 void on_data_received(const uint8_t *mac_address, const uint8_t *incoming_data_buffer, int data_length)
+#endif
 {
+    // Ignore packets that are not exactly our struct (else memcpy reads past the data)
+    if (data_length != sizeof(incoming_sensor_data))
+    {
+        Serial.println("! Ignored packet with wrong size");
+        return;
+    }
+
     // Copy incoming data to our global buffer for the main loop to process
     memcpy(&incoming_sensor_data, incoming_data_buffer, sizeof(incoming_sensor_data));
 
@@ -235,6 +247,9 @@ void setup()
         Serial.println("\n✓ WiFi connected!");
         Serial.print("IP Address: ");
         Serial.println(WiFi.localIP());
+        // the robot must use this same channel (WIFI_CHANNEL in robo.ino)
+        Serial.print("WiFi channel: ");
+        Serial.println(WiFi.channel());
     }
     else
     {
