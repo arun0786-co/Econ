@@ -127,6 +127,7 @@ You need:
 2. ESP32 board package installed
 3. USB cables for both ESP32s
 4. PySerial library (for board detection)
+5. Arduino libraries (Library Manager): **DHT sensor library** (Adafruit) and **ESP32Servo**. the normal Servo library does not work on ESP32
 
 ### Arduino IDE Setup
 
@@ -357,7 +358,7 @@ OBSTACLE_DISTANCE_THRESHOLD = 20 cm
 STOP_DELAY_MS = 200 ms
 TURN_DELAY_MS = 400 ms
 SENSOR_READ_INTERVAL = 1500 ms
-ESP_NOW_CHANNEL = 0
+WIFI_CHANNEL = 1   // set to your router's channel, the room esp32 prints it at boot
 ```
 
 ### Room Code
@@ -479,7 +480,7 @@ last_gas_alert_time             // Timestamp to throttle alerts
 ## 📡 ESP-NOW Details
 
 - **Protocol**: Low-latency wireless mesh
-- **Channel**: 0 (WiFi channel)
+- **Channel**: must be the same on both boards. the room esp32 joins your wifi router, so it uses the router's channel. the robot sets the same one with `WIFI_CHANNEL` in robo.ino (check the room's serial monitor: `WiFi channel: 6`)
 - **Range**: ~250m line of sight
 - **Bandwidth**: ~11 bytes every 1.5s ≈ 73 bps
 - **Latency**: 5-50ms typical
@@ -492,3 +493,10 @@ last_gas_alert_time             // Timestamp to throttle alerts
 |--------|------|--------|----------|
 | Robot | 150mA | 350mA | 2-3 hrs |
 | Room | 200mA | 500mA | Continuous |
+
+## fixes (oct 2026)
+
+- works with ESP32 board package 3.x now (the ESP-NOW receive function changed there)
+- uses ESP32Servo, the old Servo include did not compile on ESP32
+- robot now goes to the router's wifi channel. before, if the router was not on channel 1 the robot data never arrived (no error shown)
+- room ignores ESP-NOW packets with the wrong size
